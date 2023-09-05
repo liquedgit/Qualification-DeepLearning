@@ -10,19 +10,21 @@ import time
 from tensorflow.keras.layers import Lambda,Input, Conv2D, Dense, BatchNormalization, Flatten, LeakyReLU, Conv2DTranspose, Reshape
 from tensorflow.keras.models import Model
 from keras.callbacks import EarlyStopping, ModelCheckpoint
-from tensorflow.keras import backend as K
-
+import tensorflow as tf
 
 
 physical_devices = tf.config.list_physical_devices('GPU')
-# print(physical_devices)
+print(physical_devices)
 tf.config.experimental.set_memory_growth(physical_devices[0],True)
+
+tf.random.set_seed(int(time.time()))
+np.random.seed(int(time.time()))
 
 data = []
 labels = []
 dataset_path = 'Vegetable'
 classes = os.listdir(dataset_path)
-img_rows, img_cols = 40,40
+img_rows, img_cols = 28,28
 
 
 for class_id, class_name in enumerate(classes):
@@ -44,129 +46,117 @@ x_train = x_train.reshape(x_train.shape[0], img_rows, img_cols, 3).astype('float
 x_test = x_test.reshape(x_test.shape[0], img_rows, img_cols, 3).astype('float32')/255.0
 x_val = x_val.reshape(x_val.shape[0], img_rows, img_cols, 3).astype('float32')/255.0
 
-def encoder(input_encoder):
-    inputs = Input(shape=input_encoder)
+class VAE(tf.keras.Model):
+    def __init__(self, latent_dim):
+        super(VAE,self).__init__()
+        self.latent_dim = latent_dim
+        self.encoder = tf.keras.Sequential(
+            [
+                Input(shape=(img_rows,img_cols,3)),
+                Conv2D(32, kernel_size=3, strides=(2,2), activation='relu'),
+                Conv2D(64, kernel_size=3, strides=(2,2), activation='relu'),
+                Flatten(),
+                Dense(latent_dim + latent_dim)
+            ]
+        )
+        self.decoder = tf.keras.Sequential(
+            [
+                Input(shape=(latent_dim,)),
+                Dense(units=7*7*64, activation=tf.nn.relu),
+                Reshape(target_shape=(7, 7, 64)),
+                Conv2DTranspose(filters=128, kernel_size=3, strides=2, padding='same', activation='relu'),
+                Conv2DTranspose(filters=64, kernel_size=3, strides=2, padding='same', activation='relu'),
+                Conv2DTranspose(filters=3, kernel_size=3, strides=1, padding='same')
+            ]
+        )
+        
+    def call(self, inputs):
+        mean, log_var = self.encode(inputs)
+        z = self.reparameterize(mean, log_var)
+        reconstructed = self.decode(z)
+        return reconstructed
     
-    x = Conv2D(32, kernel_size=3, strides=2, padding='same')(inputs)
-    x = BatchNormalization()(x)
-    x = LeakyReLU()(x)
+    @tf.function
+    def decode(self, z, apply_sigmoid=False):
+        logits = self.decoder(z)
+        if apply_sigmoid:
+            probs = tf.sigmoid(logits)
+            return probs
+        return logits
     
-    x = Conv2D(64, kernel_size=3,strides=2, padding='same')(x)
-    x = BatchNormalization()(x)
-    x = LeakyReLU()(x)
+    def encode(self,x):
+        mean, log_var = tf.split(self.encoder(x), num_or_size_splits=2, axis=1)
+        return mean, log_var
     
-    x = Conv2D(64, kernel_size=3,strides=2, padding='same')(x)
-    x = BatchNormalization()(x)
-    x = LeakyReLU()(x)
+    def reparameterize(self, mean,log_var):
+        eps = tf.random.normal(shape=mean.shape)
+        return eps*tf.exp(log_var*.5) + mean
     
-    x = Conv2D(64, kernel_size=3,strides=2, padding='same')(x)
-    x = BatchNormalization()(x)
-    x = LeakyReLU()(x)
+    def sample(self, eps=None):
+        if eps is None:
+            eps = tf.random.normal(shape=(100,self.latent_dim))
+        return self.decode(eps, apply_sigmoid=True)
+optimizer = tf.keras.optimizers.Adam(0.001)
+
     
-    x = Conv2D(64, kernel_size=3,strides=2, padding='same')(x)
-    x = BatchNormalization()(x)
-    x = LeakyReLU()(x)
+def compute_loss(model, x):
+    mean, logvar = model.encode(x)
+    z = model.reparameterize(mean, logvar)
+    x_recon = model.decode(z)
     
-    flatten = Flatten()(x)
-    mean = Dense(200)(flatten)
-    log_var = Dense(200)(flatten)
-    model = Model(inputs, (mean,log_var))
-    return model
-
-def decoder(input_decoder):
-     
-    inputs = Input(shape=input_decoder, name='input_layer')
-    x = Dense(4096, name='dense_1')(inputs)
-    x = Reshape((8,8,64), name='Reshape')(x)
-     
-    x = Conv2DTranspose(64, kernel_size=3, strides=2, padding='same')(x)
-    x = BatchNormalization(name='bn_1')(x)
-    x = LeakyReLU(name='lrelu_1')(x)
+    recon_loss = tf.reduce_mean(tf.square(x - x_recon))
     
-    x = Conv2DTranspose(64, kernel_size=3, strides=2, padding='same')(x)
-    x = BatchNormalization(name='bn_2')(x)
-    x = LeakyReLU(name='lrelu_2')(x)
-  
-    x = Conv2DTranspose(64, kernel_size=3, strides=2, padding='same')(x)
-    x = BatchNormalization(name='bn_3')(x)
-    x = LeakyReLU(name='lrelu_3')(x)
+    kl_loss = -0.5 * tf.reduce_sum(1 + logvar - tf.square(mean) - tf.exp(logvar))
     
-    x = Conv2DTranspose(32, kernel_size=3, strides=2, padding='same')(x)
-    x = BatchNormalization(name='bn_4')(x)
-    x = LeakyReLU(name='lrelu_4')(x)
- 
-    outputs = Conv2DTranspose(3, kernel_size=3, strides=2,padding='same', activation='sigmoid')(x)
-    model = Model(inputs, outputs)
-    return model
+    return recon_loss, kl_loss
 
-def sampling_reparameterization(args):
-    mean, log_var = args
-    epsilon = tf.random.normal(shape=tf.shape(mean))
-    return mean * tf.exp(log_var/2)*epsilon
+@tf.function
+def train_step(model, x, optimizer):
+    with tf.GradientTape() as tape:
+        recon_loss, kl_loss = compute_loss(model, x)
+        total_loss = recon_loss + kl_loss
+    
+    gradients = tape.gradient(total_loss, model.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+    return total_loss, recon_loss, kl_loss 
+    
+epochs = 50
+batch_size = 64
+loss_values = []
+vae = VAE(latent_dim=50)
 
-def sampling(input_1, input_2):
-    mean = Input(shape=input_1)
-    log_var = Input(shape=input_2)
-    out = Lambda(sampling_reparameterization)([mean,log_var])
-    enc = Model([mean,log_var], out)
-    return enc
+# Training
+for epoch in range(epochs):
+    print(f"Starting epoch {epoch}")
+    for train_x in x_train:
+        total_loss, recon_loss, kl_loss = train_step(vae, tf.expand_dims(train_x,0), optimizer)
+    loss_values.append(recon_loss.numpy())
+    print(f"Finished epoch {epoch}") 
 
-input_shape = (img_rows,img_cols,3)
-def vae_loss(x, reconstructed_x):
-    reconstruction_loss = tf.keras.losses.mse(K.flatten(x), K.flatten(reconstructed_x))
-    reconstruction_loss *= img_rows * img_cols * 3
-    kl_loss = 1 + log_var - K.square(mean) - K.exp(log_var)
-    kl_loss = K.sum(kl_loss, axis=-1)
-    kl_loss *= -0.5
-    return K.mean(reconstruction_loss + kl_loss)
-
-# Build the VAE model
-encoder_model = encoder((img_rows, img_cols, 3))
-decoder_model = decoder(200)
-
-inputs = Input(shape=(img_rows, img_cols, 3))
-mean, log_var = encoder_model(inputs)
-sampling_model = sampling(200, 200)
-z = sampling_model([mean, log_var])
-outputs = decoder_model(z)
-
-vae = Model(inputs, outputs)
-vae.add_loss(vae_loss(inputs, outputs))
-vae.compile(optimizer='adam')
-
-# Early stopping and model checkpoint
-early_stopping = EarlyStopping(monitor='val_loss', patience=10)
-checkpoint = ModelCheckpoint("best_vae_model.h5", save_best_only=True)
-
-# Train VAE
-history = vae.fit(x_train, x_train,
-                  epochs=100,
-                  batch_size=32,
-                  validation_data=(x_val, x_val),
-                  callbacks=[early_stopping, checkpoint])
-
-# Plotting the reconstruction loss
-plt.plot(history.history['loss'], label='Training Loss')
-plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.plot(loss_values)
+plt.title('Reconstruction Loss')
 plt.xlabel('Epoch')
 plt.ylabel('Loss')
-plt.legend()
 plt.show()
 
-# Reconstruct images from the test set
-reconstructed_imgs = vae.predict(x_test)
+vae.save('best_model', save_format='tf')
+reconstructed_images = vae.decode(vae.encode(x_test)[0])
 
-# Display original and reconstructed images
-n = 10  # Number of images to display
+
+n = 10
 plt.figure(figsize=(20, 4))
 for i in range(n):
-    # Original images
     ax = plt.subplot(2, n, i + 1)
-    plt.imshow(x_test[i].reshape(img_rows, img_cols, 3))
-    ax.axis('off')
+    plt.imshow(x_test[i])
+    plt.title("Original")
+    plt.gray()
+    ax.get_xaxis().set_visible(False)
+    ax.get_yaxis().set_visible(False)
 
-    # Reconstructed images
-    ax = plt.subplot(2, n, i + n + 1)
-    plt.imshow(reconstructed_imgs[i].reshape(img_rows, img_cols, 3))
-    ax.axis('off')
+    ax = plt.subplot(2, n, i + 1 + n)
+    plt.imshow(reconstructed_images[i].numpy())
+    plt.title("Reconstructed")
+    plt.gray()
+    ax.get_xaxis().set_visible(False)
+    ax.get_yaxis().set_visible(False)
 plt.show()
