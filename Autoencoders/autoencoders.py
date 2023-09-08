@@ -7,10 +7,9 @@ import os
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import time
-from tensorflow.keras.layers import Lambda,Input, Conv2D, Dense, BatchNormalization, Flatten, LeakyReLU, Conv2DTranspose, Reshape
+from tensorflow.keras.layers import Lambda,Input, Conv2D, Dense, BatchNormalization, Flatten, Conv2DTranspose, Reshape
 from tensorflow.keras.models import Model
 from keras.callbacks import EarlyStopping, ModelCheckpoint
-import tensorflow as tf
 
 
 physical_devices = tf.config.list_physical_devices('GPU')
@@ -24,8 +23,10 @@ data = []
 labels = []
 dataset_path = 'Vegetable'
 classes = os.listdir(dataset_path)
-img_rows, img_cols = 28,28
-
+img_rows, img_cols = 35, 35
+recons_loss_list = []
+kl_div_list = []
+total_loss_list = []
 
 for class_id, class_name in enumerate(classes):
     folder_path = os.path.join(dataset_path, class_name)
@@ -46,117 +47,129 @@ x_train = x_train.reshape(x_train.shape[0], img_rows, img_cols, 3).astype('float
 x_test = x_test.reshape(x_test.shape[0], img_rows, img_cols, 3).astype('float32')/255.0
 x_val = x_val.reshape(x_val.shape[0], img_rows, img_cols, 3).astype('float32')/255.0
 
-class VAE(tf.keras.Model):
-    def __init__(self, latent_dim):
-        super(VAE,self).__init__()
-        self.latent_dim = latent_dim
-        self.encoder = tf.keras.Sequential(
-            [
-                Input(shape=(img_rows,img_cols,3)),
-                Conv2D(32, kernel_size=3, strides=(2,2), activation='relu'),
-                Conv2D(64, kernel_size=3, strides=(2,2), activation='relu'),
-                Flatten(),
-                Dense(latent_dim + latent_dim)
-            ]
-        )
-        self.decoder = tf.keras.Sequential(
-            [
-                Input(shape=(latent_dim,)),
-                Dense(units=7*7*64, activation=tf.nn.relu),
-                Reshape(target_shape=(7, 7, 64)),
-                Conv2DTranspose(filters=128, kernel_size=3, strides=2, padding='same', activation='relu'),
-                Conv2DTranspose(filters=64, kernel_size=3, strides=2, padding='same', activation='relu'),
-                Conv2DTranspose(filters=3, kernel_size=3, strides=1, padding='same')
-            ]
-        )
-        
-    def call(self, inputs):
-        mean, log_var = self.encode(inputs)
-        z = self.reparameterize(mean, log_var)
-        reconstructed = self.decode(z)
-        return reconstructed
-    
-    @tf.function
-    def decode(self, z, apply_sigmoid=False):
-        logits = self.decoder(z)
-        if apply_sigmoid:
-            probs = tf.sigmoid(logits)
-            return probs
-        return logits
-    
-    def encode(self,x):
-        mean, log_var = tf.split(self.encoder(x), num_or_size_splits=2, axis=1)
-        return mean, log_var
-    
-    def reparameterize(self, mean,log_var):
-        eps = tf.random.normal(shape=mean.shape)
-        return eps*tf.exp(log_var*.5) + mean
-    
-    def sample(self, eps=None):
-        if eps is None:
-            eps = tf.random.normal(shape=(100,self.latent_dim))
-        return self.decode(eps, apply_sigmoid=True)
-optimizer = tf.keras.optimizers.Adam(0.001)
 
-    
-def compute_loss(model, x):
-    mean, logvar = model.encode(x)
-    z = model.reparameterize(mean, logvar)
-    x_recon = model.decode(z)
-    
-    recon_loss = tf.reduce_mean(tf.square(x - x_recon))
-    
-    kl_loss = -0.5 * tf.reduce_sum(1 + logvar - tf.square(mean) - tf.exp(logvar))
-    
-    return recon_loss, kl_loss
-
-@tf.function
-def train_step(model, x, optimizer):
-    with tf.GradientTape() as tape:
-        recon_loss, kl_loss = compute_loss(model, x)
-        total_loss = recon_loss + kl_loss
-    
-    gradients = tape.gradient(total_loss, model.trainable_variables)
-    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-    return total_loss, recon_loss, kl_loss 
-    
+learning_rate = 0.001
+batch_size = 256
 epochs = 50
-batch_size = 64
-loss_values = []
-vae = VAE(latent_dim=50)
+latent_dim = 512
+hidden_dim =1024
+image_size = img_rows * img_cols * 3
+np.random.seed(25)
+tf.random.set_seed(25)
 
-# Training
+# print( x_train.shape[1])
+# print(x_train.shape[2])
+# print(image_size)
+
+
+
+class VAE(tf.keras.Model):
+    def __init__(self, dim, **kwargs):
+        super().__init__(**kwargs)
+        h_dim = dim[0]
+        z_dim = dim[1]
+        self.fc1 = Dense(h_dim, activation='relu', kernel_regularizer=l2(0.001))
+        self.fc2 = Dense(h_dim//2, activation='relu', kernel_regularizer=l2(0.001))
+        self.fc3 = Dense(z_dim, kernel_regularizer=l2(0.001))
+        self.fc4 = Dense(z_dim, kernel_regularizer=l2(0.001))
+        self.fc5 = Dense(h_dim//2, activation='relu', kernel_regularizer=l2(0.001))
+        self.fc6 = Dense(h_dim, activation='relu', kernel_regularizer=l2(0.001))
+        self.fc7 = Dense(image_size, kernel_regularizer=l2(0.001))
+    
+    def encode(self, x):
+        h = self.fc1(x)
+        h = self.fc2(h)
+        return self.fc3(h), self.fc4(h)
+    
+    def reparameterize(self, mu, log_var):
+        std = tf.exp(log_var * 0.5)
+        eps = tf.random.normal(std.shape)
+        return mu + eps * std
+    
+    def decode_logits(self, z):
+        h = self.fc5(z)
+        h = self.fc6(h)
+        return self.fc7(h)
+    
+    def decode(self,z):
+        return tf.nn.sigmoid(self.decode_logits(z))
+    
+    def call(self, inputs, training=None, mask=None):
+        mu, log_var = self.encode(inputs)
+        z = self.reparameterize(mu, log_var)
+        x_recons = self.decode_logits(z)
+        return x_recons, mu, log_var
+
+model = VAE([hidden_dim, latent_dim])
+model.build(input_shape=(4, image_size))
+
+print(model.summary())
+optimizer = tf.keras.optimizers.Adam(learning_rate)
+
+num_batches = x_train.shape[0] // batch_size
+train_dataset = tf.data.Dataset.from_tensor_slices(x_train).shuffle(batch_size).batch(batch_size)
 for epoch in range(epochs):
-    print(f"Starting epoch {epoch}")
-    for train_x in x_train:
-        total_loss, recon_loss, kl_loss = train_step(vae, tf.expand_dims(train_x,0), optimizer)
-    loss_values.append(recon_loss.numpy())
-    print(f"Finished epoch {epoch}") 
+    for step, x in enumerate(train_dataset):
+        x = tf.reshape(x, [-1, img_rows, img_cols, 3])
+        x_flat = tf.reshape(x, [-1, image_size])
 
-plt.plot(loss_values)
-plt.title('Reconstruction Loss')
-plt.xlabel('Epoch')
+        with tf.GradientTape() as tape:
+            x_recons, mu, log_var = model(x_flat)
+            x_recons = tf.reshape(x_recons, [-1, img_rows, img_cols, 3])
+
+            
+            kl_div = -0.5 * tf.reduce_sum(1 + log_var - tf.square(mu) - tf.exp(log_var) + 1e-10, axis=-1)
+            kl_div = tf.reduce_mean(kl_div)
+            recons_loss = tf.reduce_mean(tf.square(x - x_recons))
+
+            loss = recons_loss + kl_div
+            recons_loss_list.append(recons_loss.numpy())
+            kl_div_list.append(kl_div.numpy())
+            total_loss_list.append(loss.numpy())
+
+        gradients = tape.gradient(loss, model.trainable_variables)
+        gradients = [tf.clip_by_value(g, -1.0, 1.0) for g in gradients]
+        optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+        
+        if (step+1) % 50 == 0:
+            print(f"Epoch [{epoch+1}/{epochs}], Step [{step+1}/{num_batches}], Recent Loss : {recons_loss}, KL Div : {kl_div}")
+
+
+z = tf.random.normal((batch_size, latent_dim))
+out = model.decode(z) * 255
+out = tf.reshape(out, [-1,img_rows,img_cols]).numpy()
+out = out.astype(np.uint8)
+
+model.save_weights('./Autoencoders/best_model.h5')
+
+plt.figure()
+plt.plot(recons_loss_list, label='Reconstruction Loss')
+plt.plot(kl_div_list, label='KL Divergence')
+plt.plot(total_loss_list, label='Total Loss')
+plt.xlabel('Training Steps')
 plt.ylabel('Loss')
+plt.legend()
+plt.title('Loss over Training Steps')
 plt.show()
 
-vae.save('best_model', save_format='tf')
-reconstructed_images = vae.decode(vae.encode(x_test)[0])
 
-
-n = 10
-plt.figure(figsize=(20, 4))
-for i in range(n):
-    ax = plt.subplot(2, n, i + 1)
-    plt.imshow(x_test[i])
-    plt.title("Original")
-    plt.gray()
+number = 10
+plt.figure(figsize=(20,4))
+for index in range(number):
+    ax = plt.subplot(2, number, index+1)
+    plt.xlabel("Rec")
+    plt.imshow(x_train[index])
     ax.get_xaxis().set_visible(False)
     ax.get_yaxis().set_visible(False)
+plt.savefig("./Autoencoders/Original image")
 
-    ax = plt.subplot(2, n, i + 1 + n)
-    plt.imshow(reconstructed_images[i].numpy())
-    plt.title("Reconstructed")
-    plt.gray()
+number = 10
+plt.figure(figsize=(20,4))
+for index in range(number):
+    ax = plt.subplot(2, number, index+1)
+    plt.xlabel("Rec")
+    plt.imshow(out[index])
     ax.get_xaxis().set_visible(False)
     ax.get_yaxis().set_visible(False)
+plt.savefig("./Autoencoders/Reconstructed Image")
 plt.show()
